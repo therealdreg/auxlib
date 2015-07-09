@@ -1,0 +1,263 @@
+LoaderLock:
+
+El LoaderLock es usado por algunas APIs como GetModuleHandle, y también cuando se ejecuta el DllMain, por eso
+hay que tener cuidado cuando se trabajen con hilos y dlls. Situación de ejemplo:
+
+Thread A: Carga una DLL, DllMain ejecuta getchar()...
+
+Thread B: Llama a GetModuleHandleA.
+
+En este simple escenario, hasta que el usuario no introduzca una tecla para que getchar se ejecute y el Thread A salga del DllMain el Thread B
+quedará a la espera.
+
+Solucion: 
+
+- Thread A comprueba con la función AuxUlibIsDLLSynchronizationHeld que está bloqueando el LoaderLock y no ejecuta llamadas que bloqueen el Thread.
+
+Funciones internas:
+
+[code]
+BOOL Win9xCheckDllSynchronization( PBOOL in )
+{
+  * in = FALSE;
+
+  return TRUE;
+}
+[/code]
+
+Es usada para el soporte de Win9x.
+
+Variables globales:
+
+[code]
+AuxpUlibData_t          AuxpUlibData;
+[/code]
+
+Estructura que inicia AuxUlibInitialize y será usada por el resto de funciones:
+
+[code]
+typedef struct AuxpUlibData_s
+{
+	DWORD                          dwPlatformId;
+	DWORD                          dwMajorVersion;
+	DWORD                          dwMinorVersion;
+	SetSystemFileCacheSize_t       RtSetSystemFileCacheSize;
+	NtSetSystemInformation_t       RtNtSetSystemInformation;
+	PrivIsDllSynchronizationHeld_t RtPrivIsDllSynchronizationHeld;
+
+} AuxpUlibData_t;
+[/code]
+
+[code]
+LONG                    AuxpInitState;
+[/code]
+
+Si la biblioteca ha sido iniciada con AuxUlibInitialize valdrá 1, en caso contrario 0.
+
+[code]
+LONG                    DLLSynchAPISafe;
+[/code]
+
+[code]
+HANDLE                * DllSynchronizationOwnerPtr;
+[/code]
+
+[code]
+/*++
+
+Routine Description:
+
+    This routine must be successfully called by an application before any
+    other routine in the library may be called. It serves to initialize any global
+    state that may be required by other routines in the file.
+
+    It is safe to call this routine in a multi-threaded environment.
+    
+Arguments:
+
+    None.
+
+Return Value:
+
+    Boolean status. Error code available via GetLastError ().
+
+--*/
+
+BOOL WINAPI AuxUlibInitialize( VOID ):
+[/code]
+
+- Si ya ha sido iniciada la biblioteca ( AuxpInitState == 1 ) se devolverá TRUE en el acto.
+
+- En caso contrario, se iniciara la estructura AuxpUlibData de la siguiente manera:
+
+-. dwPlatformId, dwMajorVersion, dwMinorVersion serán igualados a los mismos campos, con los mismos valores, de la estructura OSVERSIONINFOW retornada por GetVersionExW().
+
+En caso de que GetVersionExW devuelva FALSE la inicialización fallará y será puesto GetLastError.
+
+-. Si los campos dwPlatformId no valen VER_PLATFORM_WIN32_NT o VER_PLATFORM_WIN32_WINDOWS la inicialización fallará y el Last error será puesto a ERROR_NOT_SUPPORTED.
+
+-. Si dwPlatformId es diferente a VER_PLATFORM_WIN32_NT se iniciará RtPrivIsDllSynchronizationHeld = Win9xCheckDllSynchronization
+
+-. Se obtendrá con GetModuleHandleW kernel32.dll y solo se obtendrá ntdll.dll si dwPlatformId es VER_PLATFORM_WIN32_NT. En caso de que falle la llamada, la inicialización fallará y el Last error será puesto a ERROR_DLL_NOT_FOUND.
+
+-. Si dwPlatformId es igual a VER_PLATFORM_WIN32_NT:
+
+--. Se obtendrán con GetProcAddress:
+
+---. RtSetSystemFileCacheSize =  GetProcAddress( "kernel32.dll", "SetSystemFileCacheSize" );
+
+Si falla por motivos diferentes a GetLastError() == ERROR_PROC_NOT_FOUND, fallará la incialización y Last error será puesto a GetLastError().
+
+---. RtNtSetSystemInformation = GetProcAddress( "ntdll.dll", "NtSetSystemInformation" );
+
+Si GetProcAddress falla, fallará la incialización y Last error será puesto Last Error a ERROR_NOT_SUPPORTED.
+
+---. RtPrivIsDllSynchronizationHeld = GetProcAddress( "kernel32.dll", "PrivIsDllSynchronizationHeld" );
+
+Si GetProcAddress falla, y GetLastError() es diferente a ERROR_PROC_NOT_FOUND, fallará la incialización y será puesto Last error a GetLastError().
+
+- Si todo ha ido bien se pondrá AuxpInitState a 1 con:
+[code]
+InterlockedExchange( & AuxpInitState, 1 );
+[/code]
+
+[code]
+/*++
+
+Routine Description:
+
+    This routine is used to set the current file system cache working set size. It 
+    requires that the caller has enabled the SE_INCREASE_QUOTA_PRIVILEGE 
+    in the currently active token prior to invoking this routine.
+
+    This API is supported on Windows 2000 and later.
+    
+Arguments:
+
+    MinimumFileCacheSize - The minimum file cache size. Use (SIZE_T)-1 if 
+        the file cache is being flushed.
+
+    MaximumFileCacheSize - The maximum file cache size. Use (SIZE_T)-1 
+        if the file cache is being flushed.
+
+    Flags - Flags relevant to the file cache size adjustment. Currently this must 
+        be zero.
+
+Return Value:
+
+    Boolean status. Error code available via GetLastError (). If the routine is
+        invoked prior to invoking the initialization routine, the returned error code
+        will be ERROR_INVALID_FUNCTION.
+
+--*/
+
+BOOL WINAPI AuxUlibSetSystemFileCacheSize 
+(
+    IN SIZE_T MinimumFileCacheSize,
+    IN SIZE_T MaximumFileCacheSize,
+    IN DWORD Flags
+);
+[/code]
+
+- Si no ha sido iniciada la biblioteca ( AuxpInitState == 0 ) se devolverá FALSE y en el Last error ERROR_INVALID_FUNCTION.
+
+- Si el campo RtSetSystemFileCacheSize ha sido iniciado se llamará a SetSystemFileCacheSize con los argumentos pasados a la función
+y se retornará lo que retorne SetSystemFileCacheSize.
+
+- Si dwMajorVersion es menor a 5 (5 = Windows Server 2003, Windows XP, or Windows 2000) se retornará FALSE y Last error a ERROR_NOT_SUPPORTED.
+
+- Si Flags no vale 0 se retornará FALSE y en Last error ERROR_INVALID_PARAMETER.
+
+- Se llama a RtNtSetSystemInformation de la siguiente manera:
+RtNtSetSystemInformation( SystemFileCacheInformation, & system_information, sizeof( system_information ) )
+
+Si RtNtSetSystemInformation devuelve mayor o igual a 0 se retornará TRUE.
+
+- En caso contrario, se retornará FALSE y en Last error ERROR_INTERNAL_ERROR.
+
+
+[code]
+/*++
+
+Routine Description:
+
+    This routine is used to determine whether or not the caller is executing
+    code while holding a system synchronization primitive. Such a situation
+    can arise when the OS temporarily calls into user-specified code as part 
+    of the DLL load procedure.
+
+    A caller can benefit from this information by avoiding operations that 
+    could potentially lead to deadlocks, e.g., acquiring a process private lock.
+
+    For example, consider the following case:
+
+        Thread A runs the THREAD_ATTACH routine for DLL X. This routine
+            is invoked with OS DLL synchronization held. Suppose further that
+            as part of this routine Thread A acquires some lock in DLL X (Lx).
+
+        Thread B runs some code in DLL X that, while holding Lx, calls the OS
+            library loader to, e.g. GetModuleHandle. As this routine acquires
+            OS DLL synchronization, Thread B will deadlock with Thread A.
+
+        This is an inherent limitation in the design of the OS loader as it
+        performs such callouts as THREAD_ATTACH while holding loader
+        synchronization. It can be partially ameliorated if Thread A detects
+        that it is running with DLL synchronization held and only try-acquires
+        other locks (such as Lx) that it may wish to take
+    
+Arguments:
+
+    SynchronizationHeld - Boolean value which indicates whether or not
+        synchronization is held.
+
+Return Value:
+
+    Boolean status. Error code available via GetLastError (). If the routine is
+        invoked prior to invoking the initialization routine, the returned error code
+        will be ERROR_INVALID_FUNCTION.
+
+--*/
+
+BOOL WINAPI AuxUlibIsDLLSynchronizationHeld( OUT PBOOL SynchronizationHeld );
+[/code]
+
+
+- Si DLLSynchAPISafe es igual a 1, se ejecuta <PROC TRUE>:
+
+<PROC TRUE>
+
+-. Si el valor al que apunta DllSynchronizationOwnerPtr es diferente a 0:
+
+--. Se retorna TRUE y donde apunta SynchronizationHeld:
+
+---. TRUE: Si el valor dónde apunta DllSynchronizationOwnerPtr (OwningThread de LoaderLock) es igual a GetCurrentThreadId().
+ 
+---. FALSE: En caso contrario.
+
+</PROC TRUE>
+
+- Si DLLSynchAPISafe es difente a 1:
+
+--. Si AuxpInitState es diferente a 1 se retorna FALSE y en Last error ERROR_INVALID_FUNCTION.
+
+--. Si RtPrivIsDllSynchronizationHeld existe, se llama a RtPrivIsDllSynchronizationHeld( SynchronizationHeld ) y se retorna lo que retorne la llamada.
+
+--. Si existe DLLSynchAPISafe:
+
+---. Si es diferente a 1 se retorna FALSE y en Last error: NOT_SUPPORTED.
+
+---. En caso contrario: se ejecuta <PROC TRUE>
+
+--. En caso contrario:
+
+---. Si dwMajorVersion es menor a 5, DLLSynchAPISafe = 2 y se retorna FALSE y en Last error NOT_SUPPORTED.
+
+---. En caso contrario, Se inicia DllSynchronizationOwnerPtr a la dirección dónde está el campo OwningThread del LoaderLock:
+DllSynchronizationOwnerPtr = & NtCurrentTeb()->Peb->LoaderLock->OwningThread;
+
+Y se pone DLLSynchAPISafe a 1 de la siguiente manera: InterlockedExchange( & DLLSynchAPISafe, 1 );
+
+Por último se llama a <PROC TRUE>.
+
+
+ 
