@@ -1,6 +1,8 @@
 # auxlib
 Full reversing of the Microsoft Auxiliary Windows API Library and ported to C
 
+Plese, consider make a donation: https://github.com/sponsors/therealdreg
+
 The LoaderLock is used by some APIs as GetModuleHandle, and also when DllMain is executed, that is why we have
  to be carefull when working with threads and dlls. Example:
 
