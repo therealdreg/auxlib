@@ -3,18 +3,23 @@ Full reversing of the Microsoft Auxiliary Windows API Library and ported to C
 
 Plese, consider make a donation: https://github.com/sponsors/therealdreg
 
-The LoaderLock is used by some APIs as GetModuleHandle, and also when DllMain is executed, that is why we have
+The LoaderLock is used to synchronize DllMain and TLS Callbacks execution (such that at any moment only single thread executes these routines). That is why we have
  to be carefull when working with threads and dlls. Example:
 
-- Thread A Loads a DLL, DllMain executes getchar()...
+- Thread A Loads a DLL, DllMain invokes function which creates thread B and waits for that thread to finish initialization.
 
-- Thread B Calls GetModuleHandleA.
+- Thread B starts execution, but before it runs the user-provided ThreadEntry function it has to invoke DllMain of various modules (with DLL_THREAD_ATTACH reason).
 
-In this simple scenario, until the user doesnt press a key Thread B will stand by.
+- Before invoking DllMain, Thread B has to acquire LoaderLock (to ensure no two DllMain are executing at the same time).  
+  However, LoaderLock is currently held by Thread A, and since Thread A waits for Thread B to finish init, LoaderLock won't ever get released.
 
-Solution:
+This situation puts Thread A and Thread B in a deadlock. Of course such scenario has arisen only due to a programmer's error (violation of documented DllMain syncronization contract). However, in some complex cases state of the LoaderLock might not be immediately obvious, so it could be useful to examine the state of the lock. It can be done with `AuxUlibIsDLLSynchronizationHeld` function from this library.  
 
-- Thread A can check with AuxUlibIsDLLSynchronizationHeld function that is blocking LoaderLock and does not execute calls that block the Thread.
+> [!NOTE]  
+> What's referred to as LoaderLock is `ntdll!LdrpLoaderLock` recursible critical section, pointed to by `PEB.LoaderLock`. It should not be confused with `ntdll!LdrpModuleDatatableLock` srwlock, which is used to protect access to loaded modules database (`LDR_DATA_TABLE_ENTRY` structures).
+
+> [!NOTE]  
+> Before Windows 10 RTM, access to modules database was also protected by LoaderLock. That means even simple GetModuleHandle call could put thread into extended wait. Nowadays it's not an issue, thanks to locks separation.
 
 Internal Functions
 
